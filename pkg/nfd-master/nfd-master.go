@@ -476,7 +476,7 @@ func (m *nfdMaster) updateMasterNode() error {
 	p := createPatches(sets.New([]string{m.instanceAnnotation(nfdv1alpha1.MasterVersionAnnotation)}...),
 		node.Annotations,
 		nil,
-		"/metadata/annotations", m.config.Restrictions.AllowOverwrite)
+		"/metadata/annotations")
 
 	err = patchNode(m.k8sClient, node.Name, p)
 	if err != nil {
@@ -1066,7 +1066,6 @@ func (m *nfdMaster) setTaints(cli k8sclient.Interface, taints []corev1.Taint, no
 	patches := createPatches(removeSet,
 		node.Annotations, newAnnotations,
 		"/metadata/annotations",
-		m.config.Restrictions.AllowOverwrite,
 	)
 	if len(patches) > 0 {
 		if err := patchNode(cli, node.Name, patches); err != nil {
@@ -1147,6 +1146,23 @@ func (m *nfdMaster) processNodeFeatureRule(nodeName string, features *nfdv1alpha
 // and taints will not be removed (but new ones will still be added).
 // This is used when the informer cache may be incomplete.
 func (m *nfdMaster) updateNodeObject(cli k8sclient.Interface, node *corev1.Node, labels Labels, featureAnnotations Annotations, extendedResources ExtendedResources, taints []corev1.Taint, skipRemoval bool) error {
+	if !m.config.Restrictions.AllowOverwrite {
+		// Leave labels, annotations and extended resources that exist on the
+		// node but were not created by NFD alone: don't change their value and
+		// don't add them to the tracking annotations, so that NFD never takes
+		// them over (and later removes them).
+		managedLabels := sets.New(stringToNsNames(node.Annotations[m.instanceAnnotation(nfdv1alpha1.FeatureLabelsAnnotation)], nfdv1alpha1.FeatureLabelNs)...)
+		managedAnnotations := sets.New(stringToNsNames(node.Annotations[m.instanceAnnotation(nfdv1alpha1.FeatureAnnotationsTrackingAnnotation)], nfdv1alpha1.FeatureAnnotationNs)...)
+		managedResources := sets.New(stringToNsNames(node.Annotations[m.instanceAnnotation(nfdv1alpha1.ExtendedResourceAnnotation)], nfdv1alpha1.FeatureLabelNs)...)
+
+		labels = dropUnmanaged(labels, managedLabels, func(k string) bool { _, ok := node.Labels[k]; return ok })
+		featureAnnotations = dropUnmanaged(featureAnnotations, managedAnnotations, func(k string) bool { _, ok := node.Annotations[k]; return ok })
+		extendedResources = dropUnmanaged(extendedResources, managedResources, func(k string) bool {
+			_, ok := node.Status.Capacity[corev1.ResourceName(k)]
+			return ok
+		})
+	}
+
 	annotations := make(Annotations)
 
 	// Store names of labels in an annotation
@@ -1215,8 +1231,8 @@ func (m *nfdMaster) updateNodeObject(cli k8sclient.Interface, node *corev1.Node,
 		)
 	}
 
-	patches := createPatches(labelsToRemove, node.Labels, labels, "/metadata/labels", m.config.Restrictions.AllowOverwrite)
-	patches = append(patches, createPatches(annotationsToRemove, node.Annotations, annotations, "/metadata/annotations", m.config.Restrictions.AllowOverwrite)...)
+	patches := createPatches(labelsToRemove, node.Labels, labels, "/metadata/labels")
+	patches = append(patches, createPatches(annotationsToRemove, node.Annotations, annotations, "/metadata/annotations")...)
 
 	// patch node status with extended resource changes
 	statusPatches := m.createExtendedResourcePatches(node, extendedResources, skipRemoval)
@@ -1247,8 +1263,10 @@ func (m *nfdMaster) updateNodeObject(cli k8sclient.Interface, node *corev1.Node,
 	return err
 }
 
-// createPatches is a generic helper that returns json patch operations to perform
-func createPatches(removeKeys sets.Set[string], oldItems map[string]string, newItems map[string]string, jsonPath string, overwrite bool) []utils.JsonPatch {
+// createPatches is a generic helper that returns json patch operations to perform.
+// Every item in newItems is added or updated; callers drop the items that must
+// not be touched (see dropUnmanaged) before calling it.
+func createPatches(removeKeys sets.Set[string], oldItems map[string]string, newItems map[string]string, jsonPath string) []utils.JsonPatch {
 	patches := []utils.JsonPatch{}
 
 	// Determine items to remove
@@ -1263,7 +1281,7 @@ func createPatches(removeKeys sets.Set[string], oldItems map[string]string, newI
 	// Determine items to add or replace
 	for key, newVal := range newItems {
 		if oldVal, ok := oldItems[key]; ok {
-			if newVal != oldVal && (!removeKeys.Has(key) || overwrite) {
+			if newVal != oldVal {
 				patches = append(patches, utils.NewJsonPatch("replace", jsonPath, key, newVal))
 			}
 		} else {
@@ -1272,6 +1290,20 @@ func createPatches(removeKeys sets.Set[string], oldItems map[string]string, newI
 	}
 
 	return patches
+}
+
+// dropUnmanaged returns a copy of items without the keys that already exist
+// on the node but are not managed by NFD.
+func dropUnmanaged[M ~map[string]string](items M, managed sets.Set[string], existsOnNode func(string) bool) M {
+	out := make(M, len(items))
+	for k, v := range items {
+		if existsOnNode(k) && !managed.Has(k) {
+			klog.V(1).InfoS("not overwriting existing key not managed by NFD (allowOverwrite is false)", "key", k)
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // createExtendedResourcePatches returns a slice of operations to perform on

@@ -269,6 +269,84 @@ func TestUpdateNodeObject(t *testing.T) {
 	})
 }
 
+func TestUpdateNodeObjectAllowOverwrite(t *testing.T) {
+	const (
+		foreignLabel      = nfdv1alpha1.FeatureLabelNs + "/foreign"
+		managedLabel      = nfdv1alpha1.FeatureLabelNs + "/managed"
+		foreignAnnotation = nfdv1alpha1.FeatureAnnotationNs + "/foreign"
+		managedAnnotation = nfdv1alpha1.FeatureAnnotationNs + "/managed"
+		foreignResource   = nfdv1alpha1.FeatureLabelNs + "/foreign-res"
+		managedResource   = nfdv1alpha1.FeatureLabelNs + "/managed-res"
+	)
+
+	Convey("When updating a node that has values set by NFD and by someone else", t, func() {
+		// "managed" items were created by NFD earlier (they are listed in the
+		// tracking annotations), "foreign" items were set by someone else.
+		testNode := newTestNode()
+		testNode.Labels[foreignLabel] = "admin"
+		testNode.Labels[managedLabel] = "old"
+		testNode.Annotations[foreignAnnotation] = "admin"
+		testNode.Annotations[managedAnnotation] = "old"
+		testNode.Annotations[nfdv1alpha1.FeatureLabelsAnnotation] = "managed"
+		testNode.Annotations[nfdv1alpha1.FeatureAnnotationsTrackingAnnotation] = "managed"
+		testNode.Annotations[nfdv1alpha1.ExtendedResourceAnnotation] = "managed-res"
+		testNode.Status.Capacity[corev1.ResourceName(foreignResource)] = resource.MustParse("1")
+		testNode.Status.Capacity[corev1.ResourceName(managedResource)] = resource.MustParse("1")
+		testNode.Status.Allocatable = testNode.Status.Capacity.DeepCopy()
+
+		labels := Labels{foreignLabel: "nfd", managedLabel: "new"}
+		annotations := Annotations{foreignAnnotation: "nfd", managedAnnotation: "new"}
+		extendedResources := ExtendedResources{foreignResource: "5", managedResource: "5"}
+
+		capacity := func(node *corev1.Node, name string) int64 {
+			q := node.Status.Capacity[corev1.ResourceName(name)]
+			return q.Value()
+		}
+
+		update := func(allowOverwrite bool) *corev1.Node {
+			fakeCli := fakeclient.NewClientset(testNode.DeepCopy())
+			fakeMaster := newFakeMaster(
+				WithKubernetesClient(fakeCli),
+				withConfig(&NFDConfig{Restrictions: Restrictions{AllowOverwrite: allowOverwrite}}),
+			)
+			err := fakeMaster.updateNodeObject(fakeCli, testNode.DeepCopy(), labels, annotations, extendedResources, nil, false)
+			So(err, ShouldBeNil)
+			node, err := fakeCli.CoreV1().Nodes().Get(context.TODO(), testNodeName, metav1.GetOptions{})
+			So(err, ShouldBeNil)
+			return node
+		}
+
+		Convey("With allowOverwrite=false NFD updates its own values and leaves the others alone", func() {
+			node := update(false)
+
+			So(node.Labels[managedLabel], ShouldEqual, "new")
+			So(node.Annotations[managedAnnotation], ShouldEqual, "new")
+			So(capacity(node, managedResource), ShouldEqual, int64(5))
+
+			So(node.Labels[foreignLabel], ShouldEqual, "admin")
+			So(node.Annotations[foreignAnnotation], ShouldEqual, "admin")
+			So(capacity(node, foreignResource), ShouldEqual, int64(1))
+
+			// The foreign items must not be taken over.
+			So(node.Annotations[nfdv1alpha1.FeatureLabelsAnnotation], ShouldEqual, "managed")
+			So(node.Annotations[nfdv1alpha1.FeatureAnnotationsTrackingAnnotation], ShouldEqual, "managed")
+			So(node.Annotations[nfdv1alpha1.ExtendedResourceAnnotation], ShouldEqual, "managed-res")
+		})
+
+		Convey("With allowOverwrite=true NFD overwrites and takes over the others", func() {
+			node := update(true)
+
+			So(node.Labels[managedLabel], ShouldEqual, "new")
+			So(node.Labels[foreignLabel], ShouldEqual, "nfd")
+			So(node.Annotations[foreignAnnotation], ShouldEqual, "nfd")
+			So(capacity(node, foreignResource), ShouldEqual, int64(5))
+			So(node.Annotations[nfdv1alpha1.FeatureLabelsAnnotation], ShouldEqual, "foreign,managed")
+			So(node.Annotations[nfdv1alpha1.FeatureAnnotationsTrackingAnnotation], ShouldEqual, "foreign,managed")
+			So(node.Annotations[nfdv1alpha1.ExtendedResourceAnnotation], ShouldEqual, "foreign-res,managed-res")
+		})
+	})
+}
+
 func TestUpdateMasterNode(t *testing.T) {
 	Convey("When updating the nfd-master node", t, func() {
 		testNode := newTestNode()
@@ -571,16 +649,15 @@ func TestFilterLabels(t *testing.T) {
 func TestCreatePatches(t *testing.T) {
 	Convey("When creating JSON patches", t, func() {
 		existingItems := map[string]string{"key-1": "val-1", "key-2": "val-2", "key-3": "val-3"}
-		overwriteKeys := true
 		jsonPath := "/root"
 
 		Convey("When there are neither itmes to remoe nor to add or update", func() {
-			p := createPatches(sets.New([]string{"foo", "bar"}...), existingItems, map[string]string{}, jsonPath, overwriteKeys)
+			p := createPatches(sets.New([]string{"foo", "bar"}...), existingItems, map[string]string{}, jsonPath)
 			So(len(p), ShouldEqual, 0)
 		})
 
 		Convey("When there are itmes to remoe but none to add or update", func() {
-			p := createPatches(sets.New([]string{"key-2", "key-3", "foo"}...), existingItems, map[string]string{}, jsonPath, overwriteKeys)
+			p := createPatches(sets.New([]string{"key-2", "key-3", "foo"}...), existingItems, map[string]string{}, jsonPath)
 			expected := []utils.JsonPatch{
 				utils.NewJsonPatch("remove", jsonPath, "key-2", ""),
 				utils.NewJsonPatch("remove", jsonPath, "key-3", ""),
@@ -590,7 +667,7 @@ func TestCreatePatches(t *testing.T) {
 
 		Convey("When there are no itmes to remove but new items to add", func() {
 			newItems := map[string]string{"new-key": "new-val", "key-1": "new-1"}
-			p := createPatches(sets.New([]string{"key-1"}...), existingItems, newItems, jsonPath, overwriteKeys)
+			p := createPatches(sets.New([]string{"key-1"}...), existingItems, newItems, jsonPath)
 			expected := []utils.JsonPatch{
 				utils.NewJsonPatch("add", jsonPath, "new-key", newItems["new-key"]),
 				utils.NewJsonPatch("replace", jsonPath, "key-1", newItems["key-1"]),
@@ -600,7 +677,7 @@ func TestCreatePatches(t *testing.T) {
 
 		Convey("When there are items to remove add and update", func() {
 			newItems := map[string]string{"new-key": "new-val", "key-2": "new-2", "key-4": "val-4"}
-			p := createPatches(sets.New([]string{"key-1", "key-2", "key-3", "foo"}...), existingItems, newItems, jsonPath, overwriteKeys)
+			p := createPatches(sets.New([]string{"key-1", "key-2", "key-3", "foo"}...), existingItems, newItems, jsonPath)
 			expected := []utils.JsonPatch{
 				utils.NewJsonPatch("add", jsonPath, "new-key", newItems["new-key"]),
 				utils.NewJsonPatch("add", jsonPath, "key-4", newItems["key-4"]),
@@ -611,10 +688,9 @@ func TestCreatePatches(t *testing.T) {
 			So(sortJsonPatches(p), ShouldResemble, sortJsonPatches(expected))
 		})
 
-		Convey("When overwrite of keys is denied and there is already an existant key", func() {
-			overwriteKeys = false
+		Convey("When an existing key is not in the remove set", func() {
 			newItems := map[string]string{"key-1": "new-2", "key-4": "val-4"}
-			p := createPatches(sets.New([]string{}...), existingItems, newItems, jsonPath, overwriteKeys)
+			p := createPatches(sets.New([]string{}...), existingItems, newItems, jsonPath)
 			expected := []utils.JsonPatch{
 				utils.NewJsonPatch("add", jsonPath, "key-4", newItems["key-4"]),
 				utils.NewJsonPatch("replace", jsonPath, "key-1", newItems["key-1"]),

@@ -379,15 +379,6 @@ resources that it manages with specific
 
 Default: true
 
-> **NOTE:** Currently `allowOverwrite: false` does not work as described above.
-> Existing node labels and annotations that were not created by NFD are still
-> overwritten, while value changes to labels and annotations that NFD already
-> manages are no longer applied, and the
-> `nfd.node.kubernetes.io/feature-labels` and
-> `nfd.node.kubernetes.io/feature-annotations` tracking annotations stop being
-> updated. Extended resources ignore this option and are always overwritten.
-> Keep the default (`true`).
-
 Example:
 
 ```yaml
